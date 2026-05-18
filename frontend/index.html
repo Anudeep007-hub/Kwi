@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KWI: Real-Time RAG Testing</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    </script>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; color: #333; }
+        .card { border: 1px solid #ddd; padding: 1.5rem; border-radius: 8px; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+        h1 { color: #111; }
+        button { background-color: #007bff; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        textarea { width: 100%; height: 80px; margin-bottom: 1rem; padding: 0.5rem; border: 1px solid #ccc; border-radius: 4px; font-family: inherit; }
+        #status, #uploadStatus, #askStatus { font-weight: bold; margin-left: 1rem; }
+        .error { color: #d9534f; }
+        .success { color: #28a745; }
+        #answerBox { display: none; background-color: #f8f9fa; padding: 1rem; border-left: 4px solid #007bff; margin-top: 1rem; }
+    </style>
+</head>
+<body>
+
+    <h1>KWI: Get the answers </h1>
+
+    <div class="card">
+        <h3>1. Upload Document</h3>
+        <input type="file" id="fileInput" accept="application/pdf">
+        <span id="uploadStatus"></span>
+    </div>
+
+    <div class="card">
+        <h3>2. Select Context (NotebookLM Style)</h3>
+        <div id="fileList"><i>No files uploaded yet.</i></div>
+    </div>
+
+    <div class="card">
+        <h3>3. Ask Llama-3</h3>
+        <textarea id="queryInput" placeholder="What is this document about?"></textarea>
+        <button id="askBtn" onclick="askQuestion()">Ask Question</button>
+        <span id="askStatus"></span>
+        <div id="answerBox">
+            <strong>Answer:</strong>
+            <p id="answerText"></p>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE_URL = "http://127.0.0.1:8000";
+        const MOCK_USER_ID = "123e4567-e89b-12d3-a456-426614174000"; 
+        
+        let uploadedFiles = [];
+        let selectedFileIds = new Set();
+
+        // HELPER: Generates a SHA-256 hash from the file bytes
+        async function calculateHash(file) {
+            const buffer = await file.arrayBuffer();
+            const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        // ONE unified upload event listener
+        document.getElementById('fileInput').addEventListener('change', async (event) => {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const statusEl = document.getElementById('uploadStatus');
+            statusEl.className = '';
+            
+            if (file.size > 5 * 1024 * 1024) {
+                statusEl.className = 'error';
+                return alert("File exceeds 5MB limit.");
+            }
+
+            try {
+                statusEl.innerText = "Hashing file to check for duplicates...";
+                
+                // 1. Calculate the Hash instantly
+                const fileHash = await calculateHash(file);
+
+                // 2. Ask the backend if it already exists
+                const checkResponse = await fetch(`${API_BASE_URL}/check-file`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "user-id": MOCK_USER_ID },
+                    body: JSON.stringify({ file_hash: fileHash })
+                });
+
+                if (!checkResponse.ok) {
+                     throw new Error(`Hash check failed: ${checkResponse.statusText}`);
+                }
+
+                const checkData = await checkResponse.json();
+
+                // 3. If it exists, SKIP EXTRACTION! Just add it to the UI.
+                if (checkData.exists) {
+                    if (!uploadedFiles.find(f => f.id === checkData.file_id)) {
+                        uploadedFiles.push({ id: checkData.file_id, name: checkData.filename });
+                        selectedFileIds.add(checkData.file_id);
+                        renderFileList();
+                    }
+                    statusEl.className = 'success';
+                    statusEl.innerText = "⚡ File already exists! Restored instantly.";
+                    return; 
+                }
+
+                // 4. If it does NOT exist, proceed with normal extraction
+                statusEl.innerText = "New file detected. Extracting text...";
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                
+                if (pdf.numPages > 50) {
+                    statusEl.className = 'error';
+                    return alert("File exceeds 50-page limit.");
+                }
+
+                let extractedText = "";
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    const page = await pdf.getPage(i);
+                    const textContent = await page.getTextContent();
+                    extractedText += textContent.items.map(item => item.str).join(" ") + "\n\n";
+                }
+
+                if (extractedText.trim().length === 0) {
+                    statusEl.className = 'error';
+                    statusEl.innerText = "Error: No text found. Is this a scanned image PDF?";
+                    return;
+                }
+
+                const rawChunks = extractedText.match(/.{1,500}/g) || [];
+                const chunksPayload = rawChunks.map(text => ({ text }));
+                
+                const fileId = crypto.randomUUID(); 
+
+                statusEl.innerText = "Sending vectors to backend...";
+
+                // 5. Send the new hash to the backend so it remembers it for next time
+                const payload = {
+                    file_id: fileId,
+                    filename: file.name,
+                    file_hash: fileHash, 
+                    chunks: chunksPayload
+                };
+
+                const response = await fetch(`${API_BASE_URL}/ingest`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "user-id": MOCK_USER_ID },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                     const errText = await response.text();
+                     throw new Error(`Upload failed: ${errText}`);
+                }
+
+                uploadedFiles.push({ id: fileId, name: file.name });
+                selectedFileIds.add(fileId);
+                renderFileList();
+                
+                statusEl.className = 'success';
+                statusEl.innerText = "Uploaded & Vectorized!";
+                
+            } catch (error) {
+                console.error(error);
+                statusEl.className = 'error';
+                statusEl.innerText = `Error: ${error.message}`;
+            }
+        });
+
+        // Renders the checkbox list
+        function renderFileList() {
+            const listDiv = document.getElementById('fileList');
+            listDiv.innerHTML = '';
+            
+            uploadedFiles.forEach(file => {
+                const label = document.createElement('label');
+                label.style.display = 'block';
+                label.style.marginBottom = '8px';
+                
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = selectedFileIds.has(file.id);
+                checkbox.onchange = (e) => {
+                    if (e.target.checked) selectedFileIds.add(file.id);
+                    else selectedFileIds.delete(file.id);
+                };
+
+                label.appendChild(checkbox);
+                label.appendChild(document.createTextNode(' ' + file.name));
+                listDiv.appendChild(label);
+            });
+        }
+
+        // Handles asking the LLM
+        async function askQuestion() {
+            const query = document.getElementById('queryInput').value;
+            const statusEl = document.getElementById('askStatus');
+            const answerBox = document.getElementById('answerBox');
+            const answerText = document.getElementById('answerText');
+
+            if (!query.trim()) return alert("Enter a question.");
+            if (selectedFileIds.size === 0) return alert("Select at least one document.");
+
+            document.getElementById('askBtn').disabled = true;
+            statusEl.className = '';
+            statusEl.innerText = "Thinking (Timing latency)...";
+            answerBox.style.display = 'none';
+
+            const startTime = performance.now(); 
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/ask`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "user-id": MOCK_USER_ID
+                    },
+                    body: JSON.stringify({
+                        query: query,
+                        selected_file_ids: Array.from(selectedFileIds)
+                    })
+                });
+
+                if (!response.ok) throw new Error("Query failed on server.");
+
+                const data = await response.json();
+                const endTime = performance.now();
+                
+                answerText.innerText = data.answer;
+                answerBox.style.display = 'block';
+                statusEl.className = 'success';
+                statusEl.innerText = `Answered in ${((endTime - startTime) / 1000).toFixed(2)}s`;
+
+            } catch (error) {
+                console.error(error);
+                statusEl.className = 'error';
+                statusEl.innerText = "Query failed.";
+            } finally {
+                document.getElementById('askBtn').disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
